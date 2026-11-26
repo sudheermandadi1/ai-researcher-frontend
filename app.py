@@ -3,18 +3,12 @@ import uuid
 
 import requests
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 
-BACKEND_BASE_URL = (
-    "https://eonjx2ovw4.execute-api.eu-central-1.amazonaws.com"
-)
-
-RESEARCH_URL = f"{BACKEND_BASE_URL}/research"
-WORKFLOW_URL = f"{BACKEND_BASE_URL}/workflow"
-HEALTH_URL = f"{BACKEND_BASE_URL}/health"
-
-REQUEST_TIMEOUT = 25
-
+# ============================================================
+# PAGE CONFIGURATION
+# ============================================================
 
 st.set_page_config(
     page_title="AI Research Assistant",
@@ -23,428 +17,734 @@ st.set_page_config(
 )
 
 
-# --------------------------------------------------
-# 1. Session ID Management
-# --------------------------------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-if "session_id" not in st.session_state:
-    url_session_id = st.query_params.get("session_id")
+try:
+    BACKEND_URL = st.secrets["BACKEND_URL"].rstrip("/")
+except (KeyError, FileNotFoundError):
+    BACKEND_URL = "http://127.0.0.1:8000"
 
-    if url_session_id:
-        st.session_state.session_id = url_session_id
-    else:
-        new_id = str(uuid.uuid4())
-        st.session_state.session_id = new_id
-        st.query_params["session_id"] = new_id
+REQUEST_TIMEOUT = 60
+REFRESH_INTERVAL = 5000
+
+TERMINAL_STATUSES = {
+    "completed",
+    "failed",
+}
+
+SUPPORTED_STATUSES = {
+    "queued",
+    "running",
+    "needs_clarification",
+    "awaiting_selection",
+    "awaiting_email",
+    "completed",
+    "failed",
+}
 
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# ============================================================
+# API HELPERS
+# ============================================================
 
-if "original_topic" not in st.session_state:
-    st.session_state.original_topic = ""
+def get_error_message(response):
+    try:
+        data = response.json()
 
-if "previous_result" not in st.session_state:
-    st.session_state.previous_result = None
+        if isinstance(data, dict):
+            detail = data.get("detail") or data.get("message")
+
+            if detail:
+                return str(detail)
+
+        return response.text or f"HTTP {response.status_code}"
+
+    except ValueError:
+        return response.text or f"HTTP {response.status_code}"
 
 
-# --------------------------------------------------
-# 2. API Helper Functions
-# --------------------------------------------------
-
-def check_backend_health():
+def api_get(path):
     try:
         response = requests.get(
-            HEALTH_URL,
-            timeout=10,
+            f"{BACKEND_URL}{path}",
+            timeout=REQUEST_TIMEOUT,
         )
 
-        response.raise_for_status()
+        if not response.ok:
+            raise requests.HTTPError(
+                get_error_message(response),
+                response=response,
+            )
 
-        return response.json().get("status") == "ok"
+        return response.json()
 
-    except requests.RequestException:
-        return False
+    except requests.Timeout as exc:
+        raise requests.Timeout(
+            "The backend request timed out."
+        ) from exc
 
+    except requests.ConnectionError as exc:
+        raise requests.ConnectionError(
+            "Could not connect to the backend."
+        ) from exc
 
-def get_workflow(session_id):
-    response = requests.get(
-        f"{WORKFLOW_URL}/{session_id}",
-        timeout=15,
-    )
-
-    if response.status_code == 404:
-        return None
-
-    response.raise_for_status()
-    return response.json()
-
-
-def call_research_api(user_response: str):
-    payload = {
-        "session_id": st.session_state.session_id,
-        "user_input": user_response,
-        "recipient_email": None,
-    }
-
-    response = requests.post(
-        RESEARCH_URL,
-        json=payload,
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    response.raise_for_status()
-
-    return response.json()
+    except ValueError as exc:
+        raise ValueError(
+            "The backend returned an invalid JSON response."
+        ) from exc
 
 
-def send_report_email(recipient_email: str):
-    payload = {
-        "session_id": st.session_state.session_id,
-        "user_input": "",
-        "recipient_email": recipient_email,
-    }
-
-    response = requests.post(
-        RESEARCH_URL,
-        json=payload,
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
-
-# --------------------------------------------------
-# 3. Restore Previous Workflow
-# --------------------------------------------------
-
-if st.session_state.previous_result is None:
+def api_post(path, payload):
     try:
-        data = get_workflow(st.session_state.session_id)
-
-        if data:
-            st.session_state.original_topic = data["original_topic"]
-            st.session_state.previous_result = data["workflow"]
-
-    except requests.RequestException as e:
-        st.warning(f"Could not restore previous workflow: {e}")
-
-
-# --------------------------------------------------
-# 4. Display Workflow Results
-# --------------------------------------------------
-
-def display_workflow_result(workflow):
-
-    status = workflow.get("status")
-
-    if status == "needs_clarification":
-
-        st.subheader("I need a little more information")
-
-        questions = workflow.get("clarifying_questions", [])
-
-        for index, question in enumerate(questions, start=1):
-            st.markdown(f"**{index}.** {question}")
-
-    elif status == "awaiting_selection":
-
-        st.subheader("Proposed research searches")
-
-        searches = workflow.get("proposed_searches", [])
-
-        for search in searches:
-            st.markdown(
-                f"**Search {search['id']}**: {search['query']}"
-            )
-
-            st.caption(search.get("reason", ""))
-
-        st.info(
-            "Enter the IDs of the searches you want to approve. "
-            "For example: 1, 2, 4"
+        response = requests.post(
+            f"{BACKEND_URL}{path}",
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
         )
 
-    elif status == "awaiting_email":
-
-        st.success("Your research report is ready.")
-
-        summary = workflow.get("short_summary", "")
-        report = workflow.get("markdown_report", "")
-        questions = workflow.get("follow_up_questions", [])
-
-        if summary:
-            st.subheader("Research summary")
-            st.write(summary)
-
-        if report:
-            st.subheader("Complete research report")
-
-            with st.expander("View complete report", expanded=True):
-                st.markdown(report)
-
-            st.download_button(
-                label="Download Markdown report",
-                data=report,
-                file_name="research_report.md",
-                mime="text/markdown",
+        if not response.ok:
+            raise requests.HTTPError(
+                get_error_message(response),
+                response=response,
             )
 
-        if questions:
-            st.subheader("Possible follow-up questions")
+        return response.json()
 
-            for question in questions:
-                st.markdown(f"- {question}")
+    except requests.Timeout as exc:
+        raise requests.Timeout(
+            "The backend request timed out."
+        ) from exc
 
-    elif status == "completed":
+    except requests.ConnectionError as exc:
+        raise requests.ConnectionError(
+            "Could not connect to the backend."
+        ) from exc
 
-        st.success("Research report email process completed.")
-
-        email_status = workflow.get("email_status", "")
-
-        if email_status:
-            st.info(email_status)
+    except ValueError as exc:
+        raise ValueError(
+            "The backend returned an invalid JSON response."
+        ) from exc
 
 
-# --------------------------------------------------
-# 5. Main Layout and Sidebar
-# --------------------------------------------------
+def get_idempotency_key(state_key):
+    if state_key not in st.session_state:
+        st.session_state[state_key] = str(uuid.uuid4())
+
+    return st.session_state[state_key]
+
+
+def clear_idempotency_key(state_key):
+    st.session_state.pop(state_key, None)
+
+
+def reset_workflow_session():
+    st.session_state.session_id = None
+
+    for key in (
+        "clarification_idempotency_key",
+        "selection_idempotency_key",
+        "email_idempotency_key",
+    ):
+        clear_idempotency_key(key)
+
+
+def display_api_error(exc):
+    st.error(str(exc))
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+if "session_id" not in st.session_state:
+    st.session_state.session_id = None
+
+
+# ============================================================
+# HEADER
+# ============================================================
 
 st.title("🔬 AI Research Assistant")
 
-st.write(
-    "Enter a research topic. The AI agents will clarify your "
-    "requirements, plan searches, conduct research, generate a "
-    "report, and optionally email it to you as a PDF."
+st.caption(
+    "Research planning, search approval, technical reports "
+    "and email delivery."
 )
 
 
-with st.sidebar:
+# ============================================================
+# NEW RESEARCH
+# ============================================================
 
-    st.header("Backend Connection")
+if not st.session_state.session_id:
 
-    if check_backend_health():
-        st.success("Backend connected")
-    else:
-        st.error("Backend unavailable")
+    with st.form("research_form"):
 
-    st.divider()
-
-    st.header("Workflow")
-
-    st.caption(
-        f"Session ID: `{st.session_state.session_id[:8]}...`"
-    )
-
-    if st.session_state.original_topic:
-
-        st.write("**Research topic:**")
-
-        st.write(st.session_state.original_topic)
-
-    if st.button("Start a new research project"):
-
-        new_id = str(uuid.uuid4())
-
-        st.session_state.session_id = new_id
-        st.query_params["session_id"] = new_id
-
-        st.session_state.messages = []
-        st.session_state.original_topic = ""
-        st.session_state.previous_result = None
-
-        st.rerun()
-
-
-# --------------------------------------------------
-# 6. Chat History
-# --------------------------------------------------
-
-for message in st.session_state.messages:
-
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-
-current_status = None
-
-if st.session_state.previous_result:
-
-    current_status = st.session_state.previous_result.get("status")
-
-
-# --------------------------------------------------
-# 7. Email Delivery
-# --------------------------------------------------
-
-if current_status == "awaiting_email":
-
-    st.divider()
-
-    st.subheader("Email your research report")
-
-    with st.form("email_form"):
-
-        recipient_email = st.text_input(
-            "Recipient email address",
-            placeholder="example@email.com",
+        topic = st.text_area(
+            "What would you like to research?",
+            placeholder=(
+                "Example: Compare modern LLM quantization "
+                "methods and their deployment trade-offs."
+            ),
+            height=120,
         )
 
-        send_email = st.form_submit_button(
-            "Generate PDF and send email"
+        submitted = st.form_submit_button(
+            "Start Research",
+            type="primary",
+            use_container_width=True,
         )
 
-    if send_email:
+    if submitted:
 
-        if not recipient_email.strip():
+        topic = topic.strip()
 
-            st.error("Please enter an email address.")
+        if len(topic) < 3:
+            st.error(
+                "Please enter a research topic containing "
+                "at least 3 characters."
+            )
 
         else:
 
+            session_id = str(uuid.uuid4())
+
             try:
+                result = api_post(
+                    "/research",
+                    {
+                        "session_id": session_id,
+                        "user_input": topic,
+                    },
+                )
 
-                with st.spinner(
-                    "Generating PDF and sending your research report..."
-                ):
+                st.session_state.session_id = (
+                    result["session_id"]
+                )
 
-                    data = send_report_email(
-                        recipient_email.strip()
+                st.success(
+                    result.get(
+                        "message",
+                        "Research submitted successfully.",
                     )
-
-                workflow = data["workflow"]
-
-                st.session_state.previous_result = workflow
-
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": workflow.get(
-                        "email_status",
-                        "Email workflow completed.",
-                    ),
-                })
+                )
 
                 st.rerun()
 
-            except requests.HTTPError as e:
+            except requests.RequestException as exc:
 
-                st.error(
-                    f"Backend HTTP error: {e.response.status_code}"
+                display_api_error(exc)
+
+                st.warning(
+                    "The request may have reached the backend. "
+                    "Check the backend before submitting another "
+                    "research request."
                 )
 
-                st.code(e.response.text)
+            except ValueError as exc:
+                display_api_error(exc)
 
-            except requests.RequestException as e:
+            except (KeyError, TypeError):
+                st.error(
+                    "The backend returned an unexpected response."
+                )
 
-                st.error(f"Backend request failed: {e}")
-
-            except Exception as e:
-
-                st.error(f"Something went wrong: {e}")
+    st.stop()
 
 
-# --------------------------------------------------
-# 8. Research Chat
-# --------------------------------------------------
+# ============================================================
+# WORKFLOW HEADER
+# ============================================================
 
-elif current_status != "completed":
+session_id = st.session_state.session_id
 
-    user_input = st.chat_input(
-        "Enter your research topic or response..."
+col1, col2 = st.columns([4, 1])
+
+with col1:
+    st.subheader("Research Conversation")
+
+with col2:
+    if st.button(
+        "Refresh",
+        use_container_width=True,
+    ):
+        st.rerun()
+
+
+# ============================================================
+# FETCH WORKFLOW DATA
+# ============================================================
+
+try:
+
+    workflow_response = api_get(
+        f"/workflow/{session_id}"
     )
 
-    if user_input:
+    history_response = api_get(
+        f"/workflow/{session_id}/messages"
+    )
 
-        st.session_state.messages.append({
-            "role": "user",
-            "content": user_input,
-        })
+except (
+    requests.RequestException,
+    ValueError,
+) as exc:
 
-        try:
+    display_api_error(exc)
+    st.stop()
 
-            with st.spinner(
-                "AI agents are processing your request..."
+
+status = workflow_response.get("status")
+
+workflow = (
+    workflow_response.get("workflow")
+    or {}
+)
+
+
+if status not in SUPPORTED_STATUSES:
+
+    st.error(
+        f"Unexpected workflow status: {status}"
+    )
+
+    st.stop()
+
+
+# ============================================================
+# WORKFLOW STATUS
+# ============================================================
+
+status_colors = {
+    "queued": "🟡",
+    "running": "🔵",
+    "needs_clarification": "🟠",
+    "awaiting_selection": "🟠",
+    "awaiting_email": "🟠",
+    "completed": "🟢",
+    "failed": "🔴",
+}
+
+st.caption(
+    f"Status: {status_colors.get(status, '⚪')} **{status}**"
+)
+
+
+# ============================================================
+# CHAT HISTORY
+# ============================================================
+
+st.divider()
+
+st.subheader("Conversation")
+
+messages = history_response.get("messages", [])
+
+if not messages:
+
+    st.info(
+        "No conversation messages are available yet."
+    )
+
+else:
+
+    for message in messages:
+
+        role = message.get("role", "assistant")
+
+        with st.chat_message(
+            "user" if role == "user" else "assistant"
+        ):
+
+            st.markdown(
+                message.get("content", "")
+            )
+
+
+# ============================================================
+# CLARIFICATION FORM
+# ============================================================
+
+if status == "needs_clarification":
+
+    st.divider()
+
+    st.subheader(
+        "A few more details are needed"
+    )
+
+    questions = workflow.get(
+        "clarifying_questions",
+        [],
+    )
+
+    if not questions:
+
+        st.warning(
+            "The workflow requires clarification, "
+            "but no questions were provided."
+        )
+
+    else:
+
+        with st.form("clarification_form"):
+
+            answers = []
+
+            for index, question in enumerate(questions):
+
+                answer = st.text_area(
+                    question,
+                    key=f"clarification_{session_id}_{index}",
+                )
+
+                answers.append(answer)
+
+            submitted = st.form_submit_button(
+                "Submit Answers",
+                type="primary",
+            )
+
+        if submitted:
+
+            if any(
+                not answer.strip()
+                for answer in answers
             ):
 
-                data = call_research_api(user_input)
-
-            st.session_state.original_topic = data["original_topic"]
-
-            workflow = data["workflow"]
-
-            st.session_state.previous_result = workflow
-
-            status = workflow.get("status", "")
-
-            if status == "needs_clarification":
-
-                assistant_message = (
-                    "I need some additional information "
-                    "before planning the research."
-                )
-
-            elif status == "awaiting_selection":
-
-                assistant_message = (
-                    "I have prepared the proposed searches. "
-                    "Please select the searches you want me to use."
-                )
-
-            elif status == "awaiting_email":
-
-                assistant_message = (
-                    "The research report has been generated. "
-                    "You can review it below and enter your email "
-                    "address to receive the PDF."
-                )
-
-            elif status == "completed":
-
-                assistant_message = (
-                    workflow.get("email_status")
-                    or "The workflow has been completed."
+                st.error(
+                    "Please answer every question."
                 )
 
             else:
 
-                assistant_message = (
-                    "The workflow returned an unknown status."
-                )
+                key_name = "clarification_idempotency_key"
 
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": assistant_message,
-            })
+                payload = {
+                    "answers": answers,
+                    "idempotency_key": get_idempotency_key(
+                        key_name
+                    ),
+                }
 
-            st.rerun()
+                try:
 
-        except requests.HTTPError as e:
+                    api_post(
+                        f"/workflow/{session_id}/clarification",
+                        payload,
+                    )
 
-            st.error(
-                f"Backend HTTP error: {e.response.status_code}"
-            )
+                    clear_idempotency_key(key_name)
 
-            st.code(e.response.text)
+                    st.success(
+                        "Clarification answers submitted."
+                    )
 
-        except requests.RequestException as e:
+                    st.rerun()
 
-            st.error(f"Backend request failed: {e}")
+                except requests.RequestException as exc:
 
-        except Exception as e:
+                    display_api_error(exc)
 
-            st.error(f"Something went wrong: {e}")
+                    st.info(
+                        "You can retry using the same "
+                        "idempotency key."
+                    )
 
 
-# --------------------------------------------------
-# 9. Display Current Workflow Output
-# --------------------------------------------------
+# ============================================================
+# SEARCH SELECTION
+# ============================================================
 
-if st.session_state.previous_result:
+elif status == "awaiting_selection":
 
     st.divider()
 
-    display_workflow_result(
-        st.session_state.previous_result
+    st.subheader(
+        "Approve Research Searches"
     )
+
+    proposed_searches = workflow.get(
+        "proposed_searches",
+        [],
+    )
+
+    if not proposed_searches:
+
+        st.warning(
+            "No proposed searches were found."
+        )
+
+    else:
+
+        with st.form("search_selection_form"):
+
+            selected_ids = []
+
+            for item in proposed_searches:
+
+                selected = st.checkbox(
+                    f'{item["id"]}. {item["query"]}',
+                    value=True,
+                    key=(
+                        f'search_{session_id}_{item["id"]}'
+                    ),
+                )
+
+                if item.get("reason"):
+
+                    st.caption(
+                        item["reason"]
+                    )
+
+                if selected:
+
+                    selected_ids.append(
+                        item["id"]
+                    )
+
+            submitted = st.form_submit_button(
+                "Approve Selected Searches",
+                type="primary",
+            )
+
+        if submitted:
+
+            if not selected_ids:
+
+                st.error(
+                    "Select at least one search."
+                )
+
+            else:
+
+                key_name = "selection_idempotency_key"
+
+                payload = {
+                    "selected_search_ids": selected_ids,
+                    "idempotency_key": get_idempotency_key(
+                        key_name
+                    ),
+                }
+
+                try:
+
+                    api_post(
+                        f"/workflow/{session_id}/selection",
+                        payload,
+                    )
+
+                    clear_idempotency_key(key_name)
+
+                    st.success(
+                        "Selected searches submitted."
+                    )
+
+                    st.rerun()
+
+                except requests.RequestException as exc:
+
+                    display_api_error(exc)
+
+                    st.info(
+                        "Retrying will reuse the same "
+                        "idempotency key."
+                    )
+
+
+# ============================================================
+# EXECUTIVE SUMMARY
+# ============================================================
+
+if workflow.get("short_summary"):
+
+    st.divider()
+
+    st.subheader(
+        "Executive Summary"
+    )
+
+    st.markdown(
+        workflow["short_summary"]
+    )
+
+
+# ============================================================
+# RESEARCH REPORT
+# ============================================================
+
+if workflow.get("markdown_report"):
+
+    st.divider()
+
+    st.subheader(
+        "Research Report"
+    )
+
+    st.markdown(
+        workflow["markdown_report"]
+    )
+
+    st.download_button(
+        "Download Markdown Report",
+        data=workflow["markdown_report"],
+        file_name="research_report.md",
+        mime="text/markdown",
+        use_container_width=True,
+    )
+
+
+# ============================================================
+# FOLLOW-UP QUESTIONS
+# ============================================================
+
+follow_up_questions = workflow.get(
+    "follow_up_questions",
+    [],
+)
+
+if follow_up_questions:
+
+    st.divider()
+
+    st.subheader(
+        "Suggested Follow-up Questions"
+    )
+
+    for question in follow_up_questions:
+
+        st.markdown(
+            f"- {question}"
+        )
+
+
+# ============================================================
+# EMAIL CONFIRMATION
+# ============================================================
+
+if status == "awaiting_email":
+
+    st.divider()
+
+    st.subheader(
+        "Email Research Report"
+    )
+
+    with st.form("email_form"):
+
+        recipient = st.text_input(
+            "Recipient email address",
+        )
+
+        confirm = st.checkbox(
+            "I confirm that I want to send this report."
+        )
+
+        submitted = st.form_submit_button(
+            "Send Research Report",
+            type="primary",
+        )
+
+    if submitted:
+
+        if not recipient.strip():
+
+            st.error(
+                "Enter a recipient email address."
+            )
+
+        elif not confirm:
+
+            st.error(
+                "Please confirm email delivery."
+            )
+
+        else:
+
+            key_name = "email_idempotency_key"
+
+            payload = {
+                "recipient_email": recipient.strip(),
+                "confirm_send": True,
+                "idempotency_key": get_idempotency_key(
+                    key_name
+                ),
+            }
+
+            try:
+
+                api_post(
+                    f"/workflow/{session_id}/email",
+                    payload,
+                )
+
+                clear_idempotency_key(key_name)
+
+                st.success(
+                    "Email delivery submitted."
+                )
+
+                st.rerun()
+
+            except requests.RequestException as exc:
+
+                display_api_error(exc)
+
+                st.warning(
+                    "If the request may have reached the backend, "
+                    "retry using the same idempotency key."
+                )
+
+
+# ============================================================
+# QUEUED / RUNNING / FAILED / COMPLETED
+# ============================================================
+
+if status in ("queued", "running"):
+
+    st.info(
+        "Your research is being processed."
+    )
+
+elif status == "completed":
+
+    st.success(
+        "Research workflow completed."
+    )
+
+elif status == "failed":
+
+    st.error(
+        workflow_response.get("error_message")
+        or "The research workflow failed."
+    )
+
+
+# ============================================================
+# AUTOMATIC REFRESH
+# ============================================================
+
+if status not in TERMINAL_STATUSES:
+
+    st_autorefresh(
+        interval=REFRESH_INTERVAL,
+        key=f"workflow_auto_refresh_{session_id}",
+    )
+
+
+# ============================================================
+# NEW RESEARCH SESSION
+# ============================================================
+
+st.divider()
+
+if st.button(
+    "Start a New Research Session",
+    use_container_width=True,
+):
+
+    reset_workflow_session()
+
+    st.rerun()
