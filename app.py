@@ -27,7 +27,7 @@ except (KeyError, FileNotFoundError):
     BACKEND_URL = "http://127.0.0.1:8000"
 
 REQUEST_TIMEOUT = 60
-REFRESH_INTERVAL = 5000
+REFRESH_INTERVAL = 30000
 
 TERMINAL_STATUSES = {
     "completed",
